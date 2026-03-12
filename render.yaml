@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: kalm-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn api:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
+    envVars:
+      - key: AZURE_OPENAI_API_KEY
+        sync: false
+      - key: AZURE_OPENAI_ENDPOINT
+        sync: false
+      - key: AZURE_CHAT_DEPLOYMENT
+        value: gpt-4.1
+      - key: AZURE_EMBEDDING_DEPLOYMENT
+        value: text-embedding-ada-002
+      - key: CHROMA_DB_PATH
+        value: ./kalm_db
