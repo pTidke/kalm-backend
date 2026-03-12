@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """
 api.py — Kalm FastAPI Backend
-Wraps the existing chat.py logic and exposes REST endpoints
-for the React frontend.
-
-Run locally:
-    uvicorn api:app --reload --port 8000
-
-With ngrok (for demo):
-    ngrok http 8000
+Deployed on Render free tier (spins down after 15min idle).
+Frontend handles the cold-start wake-up automatically.
 """
 
 import os
 import uuid
+import time
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,11 +25,11 @@ from config import (
 
 load_dotenv()
 
-# ─── App Setup ──────────────────────────────────────────────────────────────
+# ─── App ─────────────────────────────────────────────────────────
 
 app = FastAPI(title="Kalm API", version="1.0.0")
+START_TIME = time.time()
 
-# Allow all origins for demo — tighten for production
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,7 +38,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Azure + ChromaDB Clients ─────────────────────────────────────────────
+# ─── Azure Clients ────────────────────────────────────────────────
 
 AZURE_ENDPOINT       = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_API_KEY        = os.getenv("AZURE_OPENAI_API_KEY")
@@ -68,32 +63,64 @@ embed_client = AzureOpenAI(
     api_version="2023-05-15",
 )
 
-chroma_client = chromadb.PersistentClient(
-    path=CHROMA_DB_PATH,
-    settings=Settings(anonymized_telemetry=False),
-)
-
 try:
+    chroma_client = chromadb.PersistentClient(
+        path=CHROMA_DB_PATH,
+        settings=Settings(anonymized_telemetry=False),
+    )
     collection = chroma_client.get_collection(COLLECTION_NAME)
     print(f"✓ ChromaDB loaded — {collection.count():,} chunks")
 except Exception as e:
     print(f"✗ ChromaDB failed: {e}")
     collection = None
 
-# ─── In-Memory Session Store ─────────────────────────────────────────────
+# ─── Sessions ─────────────────────────────────────────────────────
 
-sessions: dict[str, dict] = {}
+sessions: dict = {}
 
-def new_session(persona_id: str = DEFAULT_PERSONA) -> dict:
+def new_session(persona_id: str) -> dict:
     return {
         "id": str(uuid.uuid4()),
         "persona_id": persona_id,
         "history": [],
         "algee_stage": 0,
         "safety_level": 0,
+        "turns_in_stage": 0,
     }
 
-# ─── Safety Detection ────────────────────────────────────────────────────
+# ─── ALGEE Stage Advancement ─────────────────────────────────────
+# Minimum user turns before the stage can advance.
+# This prevents the bot from rushing to "see a professional" after 2 messages.
+STAGE_MIN_TURNS = {
+    "approach":               3,   # 3 turns just listening, no advice
+    "listen":                 3,   # 3 turns validating before giving any info
+    "give_info":              2,   # 2 turns of info before suggesting professional help
+    "encourage_professional": 2,   # 2 turns before moving to self-help strategies
+    "encourage_self":         99,  # never auto-advance past this
+}
+
+def should_advance_stage(session: dict, user_message: str) -> bool:
+    """
+    Advance the ALGEE stage only when:
+    1. The minimum turns for this stage have been spent
+    2. The user message shows meaningful engagement (>6 words)
+       Short replies like "ok", "yeah", "idk" mean stay and keep listening
+    """
+    current_stage_name = ALGEE_STAGES[session["algee_stage"]]["name"]
+    min_turns = STAGE_MIN_TURNS.get(current_stage_name, 2)
+    turns_in_stage = session.get("turns_in_stage", 0)
+
+    if turns_in_stage < min_turns:
+        return False
+
+    # Short messages = user hasn't opened up yet — give them more time
+    word_count = len(user_message.strip().split())
+    if word_count < 6 and turns_in_stage < (min_turns + 2):
+        return False
+
+    return True
+
+# ─── Safety ───────────────────────────────────────────────────────
 
 def detect_safety_level(text: str) -> int:
     lower = text.lower()
@@ -104,15 +131,14 @@ def detect_safety_level(text: str) -> int:
         return 1
     return 0
 
-# ─── RAG Retrieval ───────────────────────────────────────────────────────
+# ─── RAG ──────────────────────────────────────────────────────────
 
 def retrieve_context(query: str) -> str:
     if not collection:
         return ""
     try:
         response = embed_client.embeddings.create(
-            input=[query],
-            model=EMBEDDING_DEPLOYMENT,
+            input=[query], model=EMBEDDING_DEPLOYMENT,
         )
         query_vector = response.data[0].embedding
         results = collection.query(
@@ -124,7 +150,7 @@ def retrieve_context(query: str) -> str:
         metadatas = results["metadatas"][0]
         distances = results["distances"][0]
 
-        seen: dict = {}
+        seen = {}
         for doc, meta, dist in zip(docs, metadatas, distances):
             disorder = meta.get("disorder_name", "Unknown")
             if disorder not in seen or dist < seen[disorder][0]:
@@ -141,13 +167,13 @@ def retrieve_context(query: str) -> str:
         print(f"RAG error: {e}")
         return ""
 
-# ─── Prompt Assembly ─────────────────────────────────────────────────────
+# ─── Prompt ───────────────────────────────────────────────────────
 
-def build_system_prompt(persona_id: str, algee_stage: int, dsm_context: str, safety_level: int) -> str:
-    persona     = PERSONAS[persona_id]
-    stage       = ALGEE_STAGES[min(algee_stage, len(ALGEE_STAGES) - 1)]
-    stage_name  = stage["name"].upper().replace("_", " ")
-    stage_guide = stage["guidance"]
+def build_system_prompt(persona_id, algee_stage, dsm_context, safety_level) -> str:
+    persona    = PERSONAS[persona_id]
+    stage      = ALGEE_STAGES[min(algee_stage, len(ALGEE_STAGES) - 1)]
+    stage_name = stage["name"].upper().replace("_", " ")
+    stage_guide= stage["guidance"]
 
     context_block = ""
     if dsm_context and algee_stage >= 2:
@@ -170,7 +196,7 @@ def build_system_prompt(persona_id: str, algee_stage: int, dsm_context: str, saf
         f"{safety_block}"
     )
 
-# ─── Request / Response Models ────────────────────────────────────────────
+# ─── Models ───────────────────────────────────────────────────────
 
 class NewSessionRequest(BaseModel):
     persona_id: Optional[str] = DEFAULT_PERSONA
@@ -186,15 +212,22 @@ class ChatResponse(BaseModel):
     algee_stage_name: str
     crisis_resources: Optional[str] = None
 
-# ─── Endpoints ───────────────────────────────────────────────────────────
+# ─── Endpoints ────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
+    """Used by frontend to wake up the server and check status."""
     return {
         "status": "ok",
         "db_chunks": collection.count() if collection else 0,
         "personas": list(PERSONAS.keys()),
+        "uptime_seconds": round(time.time() - START_TIME),
     }
+
+@app.get("/ping")
+def ping():
+    """Lightweight wake-up endpoint."""
+    return {"pong": True}
 
 @app.post("/session/new")
 def create_session(req: NewSessionRequest):
@@ -203,7 +236,6 @@ def create_session(req: NewSessionRequest):
     session = new_session(req.persona_id)
     sessions[session["id"]] = session
 
-    # Generate greeting
     greetings = {
         "mate":      "Hey. Glad you showed up — that takes guts. What's going on?",
         "counselor": "Welcome. I'm Kalm — a safe space to talk. What brings you here today?",
@@ -223,30 +255,24 @@ def create_session(req: NewSessionRequest):
 def chat(req: ChatRequest):
     session = sessions.get(req.session_id)
     if not session:
-        raise HTTPException(404, "Session not found. Create a new session first.")
+        raise HTTPException(404, "Session not found — please start a new session.")
 
-    # Safety check
     msg_safety = detect_safety_level(req.message)
     session["safety_level"] = max(session["safety_level"], msg_safety)
-
-    # RAG
     dsm_context = retrieve_context(req.message)
 
-    # Build prompt
     system_prompt = build_system_prompt(
-        persona_id  = session["persona_id"],
-        algee_stage = session["algee_stage"],
-        dsm_context = dsm_context,
-        safety_level= session["safety_level"],
+        persona_id  =session["persona_id"],
+        algee_stage =session["algee_stage"],
+        dsm_context =dsm_context,
+        safety_level=session["safety_level"],
     )
 
-    # Build messages
     history_window = session["history"][-(MAX_HISTORY_TURNS * 2):]
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history_window)
     messages.append({"role": "user", "content": req.message})
 
-    # Call Azure GPT
     try:
         response = az_client.chat.completions.create(
             model=CHAT_DEPLOYMENT,
@@ -256,14 +282,31 @@ def chat(req: ChatRequest):
         )
         reply = response.choices[0].message.content.strip()
     except Exception as e:
-        reply = f"Sorry, I had a bit of trouble connecting just now. Please try again. ({e})"
+        error_str = str(e)
+        if "content_filter" in error_str.lower():
+            reply = (
+                "I want to make sure you're okay. If you're in a dark place right now, "
+                "please reach out to the 988 Suicide & Crisis Lifeline — call or text 988. "
+                "They're available 24/7 and understand what you're going through."
+            )
+        else:
+            reply = f"Sorry, I had trouble connecting. Please try again."
 
-    # Update session
     session["history"].append({"role": "user", "content": req.message})
     session["history"].append({"role": "assistant", "content": reply})
-    session["algee_stage"] = min(session["algee_stage"] + 1, len(ALGEE_STAGES) - 1)
 
-    # ALGEE hold on crisis
+    # Increment turns in current stage
+    session["turns_in_stage"] = session.get("turns_in_stage", 0) + 1
+
+    # Only advance stage when the user is genuinely ready
+    if should_advance_stage(session, req.message):
+        old_stage = session["algee_stage"]
+        session["algee_stage"] = min(session["algee_stage"] + 1, len(ALGEE_STAGES) - 1)
+        # Reset turn counter when stage changes
+        if session["algee_stage"] != old_stage:
+            session["turns_in_stage"] = 0
+
+    # ALGEE hold — never push past encourage_professional during crisis
     if session["safety_level"] >= 1:
         session["algee_stage"] = min(session["algee_stage"], 3)
 
@@ -276,15 +319,3 @@ def chat(req: ChatRequest):
         algee_stage_name=stage_name,
         crisis_resources=CRISIS_RESOURCES if msg_safety == 2 else None,
     )
-
-@app.post("/session/{session_id}/switch-persona")
-def switch_persona(session_id: str, req: NewSessionRequest):
-    if session_id not in sessions:
-        raise HTTPException(404, "Session not found.")
-    if req.persona_id not in PERSONAS:
-        raise HTTPException(400, f"Unknown persona: {req.persona_id}")
-    sessions[session_id]["persona_id"] = req.persona_id
-    sessions[session_id]["history"] = []
-    sessions[session_id]["algee_stage"] = 0
-    sessions[session_id]["safety_level"] = 0
-    return {"status": "ok", "persona": PERSONAS[req.persona_id]["label"]}
