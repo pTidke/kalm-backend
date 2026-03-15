@@ -237,10 +237,10 @@ def create_session(req: NewSessionRequest):
     sessions[session["id"]] = session
 
     greetings = {
-        "mate":      "Hey. Glad you showed up — that takes guts. What's going on?",
-        "counselor": "Welcome. I'm Kalm — a safe space to talk. What brings you here today?",
-        "mindful":   "Hello. Take a breath. Whatever brought you here, you're in the right place. What's present for you right now?",
-        "info":      "Hi, I'm Kalm. I'm here to help you understand what you're experiencing. What would you like to talk about?",
+        "mate":      "Long shift? Rough day? Whatever it is — go ahead.",
+        "counselor": "Hey. What's going on?",
+        "mindful":   "Take a minute. What's on your mind?",
+        "info":      "What do you need to know?",
     }
     greeting = greetings.get(req.persona_id, greetings["mate"])
     session["history"].append({"role": "assistant", "content": greeting})
