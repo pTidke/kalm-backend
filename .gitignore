@@ -1,0 +1,22 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Vector database (large, locally generated)
+kalm_db/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

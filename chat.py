@@ -20,7 +20,7 @@ import random
 import chromadb
 from chromadb.config import Settings
 from openai import AzureOpenAI
-from colorama import init, Fore, Back, Style
+from colorama import init, Fore, Style
 
 from config import (
     PERSONAS, DEFAULT_PERSONA, ALGEE_STAGES, CORE_RULES,
@@ -43,15 +43,15 @@ CHROMA_DB_PATH         = os.getenv("CHROMA_DB_PATH", "./kalm_db")
 TOP_K                  = int(os.getenv("TOP_K_RESULTS", "5"))
 COLLECTION_NAME        = "dsm_knowledge"
 MAX_HISTORY_TURNS      = 8    # number of user+assistant turn pairs to keep
-MAX_RESPONSE_TOKENS    = 600
+MAX_RESPONSE_TOKENS    = 250  # Texting-peer style — short bursts, not paragraphs
 
 # ─── Terminal UI helpers ──────────────────────────────────────────────────────
 
 PERSONA_COLORS = {
-    "mate":      Fore.YELLOW,
-    "counselor": Fore.CYAN,
-    "mindful":   Fore.GREEN,
-    "info":      Fore.MAGENTA,
+    "mack": Fore.YELLOW,   # warm, earthy — the quiet ironworker
+    "ray":  Fore.CYAN,     # sharp, direct — the no-filter pipefitter
+    "deb":  Fore.GREEN,    # steady, grounded — the experienced safety lead
+    "lou":  Fore.MAGENTA,  # warm, lived-in — the foreman who's been through it
 }
 
 def clear_line():
@@ -443,22 +443,27 @@ def main():
 
     # ── Opening message ──
     greetings = {
-        "mate": [
-            "Hey. Glad you showed up — that takes guts. What's going on?",
-            "Hey. Good to have you here. What's on your mind?",
-            "Hey. Whatever brought you here today, you made the right call. What's up?",
+        # Each set of greetings is written in that character's voice.
+        # Short, plain, no therapy opener — just an open door.
+        "mack": [
+            "Go ahead. I'm listening.",
+            "Take your time. What's going on?",
+            "I'm here. What's on your mind?",
         ],
-        "counselor": [
-            "Welcome. I'm Kalm — a safe space to talk. What brings you here today?",
-            "Hi there. Whatever's going on, you don't have to carry it alone. What's on your mind?",
+        "ray": [
+            "Alright, what's going on?",
+            "Talk to me. What's up?",
+            "What's happening?",
         ],
-        "mindful": [
-            "Hello. Take a breath. Whatever brought you here, you're in the right place. What's present for you right now?",
-            "Hi. Glad you're here. Let's just slow down for a second — what's going on for you today?",
+        "deb": [
+            "Hey. Whatever's on your mind — this is a good place for it.",
+            "Hey. You showed up, that matters. What's going on?",
+            "Go ahead. I've got time.",
         ],
-        "info": [
-            "Hi, I'm Kalm. I can help you understand what you're experiencing. What would you like to talk about?",
-            "Hey. I'm here to help you make sense of things. What's on your mind?",
+        "lou": [
+            "Take your time. What's going on with you?",
+            "Hey. Whatever brought you here — I'm glad you came. What's up?",
+            "No rush. What's on your mind?",
         ],
     }
 

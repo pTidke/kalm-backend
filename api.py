@@ -49,7 +49,7 @@ CHROMA_DB_PATH       = os.getenv("CHROMA_DB_PATH", "./kalm_db")
 TOP_K                = int(os.getenv("TOP_K_RESULTS", "5"))
 COLLECTION_NAME      = "dsm_knowledge"
 MAX_HISTORY_TURNS    = 8
-MAX_RESPONSE_TOKENS  = 600
+MAX_RESPONSE_TOKENS  = 250  # Texting-peer style — short bursts, not paragraphs
 
 az_client = AzureOpenAI(
     azure_endpoint=AZURE_ENDPOINT,
@@ -237,12 +237,14 @@ def create_session(req: NewSessionRequest):
     sessions[session["id"]] = session
 
     greetings = {
-        "mate":      "Long shift? Rough day? Whatever it is — go ahead.",
-        "counselor": "Hey. What's going on?",
-        "mindful":   "Take a minute. What's on your mind?",
-        "info":      "What do you need to know?",
+        # Each greeting is written in that character's voice —
+        # short, human, no therapy opener, just an invitation to talk.
+        "mack": "Go ahead. I'm listening.",
+        "ray":  "Alright, what's going on?",
+        "deb":  "Hey. Whatever's on your mind — this is a good place for it.",
+        "lou":  "Take your time. What's going on with you?",
     }
-    greeting = greetings.get(req.persona_id, greetings["mate"])
+    greeting = greetings.get(req.persona_id, greetings["mack"])
     session["history"].append({"role": "assistant", "content": greeting})
 
     return {
