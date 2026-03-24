@@ -28,25 +28,30 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user    ON sessions(user_id);
 ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 
--- Only the service role (backend) can access these tables
-CREATE POLICY "Service role full access on sessions"
+-- Only the service_role (backend) can access these tables
+CREATE POLICY "Service role only on sessions"
     ON sessions FOR ALL
+    TO service_role
     USING (true)
     WITH CHECK (true);
 
-CREATE POLICY "Service role full access on messages"
+CREATE POLICY "Service role only on messages"
     ON messages FOR ALL
+    TO service_role
     USING (true)
     WITH CHECK (true);
 
 -- Auto-update updated_at on sessions
 CREATE OR REPLACE FUNCTION update_updated_at()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
 BEGIN
     NEW.updated_at = now();
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 CREATE TRIGGER sessions_updated_at
     BEFORE UPDATE ON sessions
