@@ -9,11 +9,15 @@ import os
 import uuid
 import time
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, validator
 from dotenv import load_dotenv
+from starlette.responses import Response
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import chromadb
 from chromadb.config import Settings
 from openai import AzureOpenAI
@@ -33,6 +37,19 @@ load_dotenv()
 app = FastAPI(title="Kalm API", version="1.0.0")
 START_TIME = time.time()
 
+# ─── Rate Limiting ────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return Response(
+        content='{"detail":"Too many requests — please slow down."}',
+        status_code=429,
+        media_type="application/json",
+    )
+
+# ─── CORS ─────────────────────────────────────────────────
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS", "https://kalm-omega.vercel.app"
 ).split(",")
@@ -41,9 +58,20 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+# ─── Security Headers ────────────────────────────────────
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
 
 # ─── Auth (Supabase JWKS) ───────────────────────────────────
 
@@ -265,24 +293,23 @@ class ChatResponse(BaseModel):
 # ─── Endpoints ──────────────────────────────────────────────
 
 @app.get("/health")
-def health():
+@limiter.limit("10/minute")
+def health(request: Request):
     """Public — used by frontend to wake up the server."""
-    return {
-        "status": "ok",
-        "db_chunks": collection.count() if collection else 0,
-        "personas": list(PERSONAS.keys()),
-        "uptime_seconds": round(time.time() - START_TIME),
-    }
+    return {"status": "ok"}
 
 
 @app.get("/ping")
-def ping():
+@limiter.limit("10/minute")
+def ping(request: Request):
     """Public — lightweight wake-up endpoint."""
     return {"pong": True}
 
 
 @app.post("/session/new")
+@limiter.limit("5/minute")
 def create_session(
+    request: Request,
     req: NewSessionRequest,
     user: dict = Depends(get_current_user),
 ):
@@ -310,7 +337,9 @@ def create_session(
 
 
 @app.post("/chat", response_model=ChatResponse)
+@limiter.limit("10/minute")
 def chat(
+    request: Request,
     req: ChatRequest,
     user: dict = Depends(get_current_user),
 ):
@@ -319,7 +348,7 @@ def chat(
         raise HTTPException(404, "Session not found — please start a new session.")
 
     # Ensure user owns this session
-    if session.get("user_id") and session["user_id"] != user.get("sub"):
+    if session["user_id"] != user.get("sub"):
         raise HTTPException(403, "Not authorized for this session")
 
     msg_safety = detect_safety_level(req.message)
