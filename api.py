@@ -8,6 +8,7 @@ Frontend handles the cold-start wake-up automatically.
 import os
 import uuid
 import time
+import logging
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,8 +30,19 @@ from config import (
     CRISIS_SIGNALS, HOPELESSNESS_SIGNALS, CRISIS_RESOURCES,
     SAFETY_ADDENDUM_CRISIS, SAFETY_ADDENDUM_HOPELESSNESS,
 )
+import session_store
 
 load_dotenv()
+
+# ─── Logging ──────────────────────────────────────────────────
+# Never log message content — only metadata (session ID, stage, safety level).
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("kalm.api")
 
 # ─── App ─────────────────────────────────────────────────────
 
@@ -136,26 +148,10 @@ try:
         settings=Settings(anonymized_telemetry=False),
     )
     collection = chroma_client.get_collection(COLLECTION_NAME)
-    print(f"✓ ChromaDB loaded — {collection.count():,} chunks")
+    logger.info("ChromaDB loaded — %s chunks", f"{collection.count():,}")
 except Exception as e:
-    print(f"✗ ChromaDB failed: {e}")
+    logger.error("ChromaDB failed to load: %s", type(e).__name__)
     collection = None
-
-# ─── Sessions ───────────────────────────────────────────────
-
-sessions: dict = {}
-
-
-def new_session(persona_id: str, user_id: str) -> dict:
-    return {
-        "id": str(uuid.uuid4()),
-        "user_id": user_id,
-        "persona_id": persona_id,
-        "history": [],
-        "algee_stage": 0,
-        "safety_level": 0,
-        "turns_in_stage": 0,
-    }
 
 
 # ─── ALGEE Stage Advancement ───────────────────────────────
@@ -229,7 +225,7 @@ def retrieve_context(query: str) -> str:
             )
         return "\n\n".join(parts)
     except Exception as e:
-        print(f"RAG error: {e}")
+        logger.error("RAG retrieval failed: %s", type(e).__name__)
         return ""
 
 
@@ -317,8 +313,8 @@ def create_session(
         raise HTTPException(400, f"Unknown persona: {req.persona_id}")
 
     user_id = user.get("sub", "anonymous")
-    session = new_session(req.persona_id, user_id)
-    sessions[session["id"]] = session
+    session_id = str(uuid.uuid4())
+    session_store.create_session(session_id, user_id, req.persona_id)
 
     greetings = {
         "mack": "Go ahead. I'm listening.",
@@ -327,10 +323,12 @@ def create_session(
         "lou":  "Take your time. What's going on with you?",
     }
     greeting = greetings.get(req.persona_id, greetings["mack"])
-    session["history"].append({"role": "assistant", "content": greeting})
+    session_store.append_message(session_id, "assistant", greeting)
+
+    logger.info("New session %s (persona=%s)", session_id[:8], req.persona_id)
 
     return {
-        "session_id": session["id"],
+        "session_id": session_id,
         "greeting": greeting,
         "persona": PERSONAS[req.persona_id]["label"],
     }
@@ -343,7 +341,7 @@ def chat(
     req: ChatRequest,
     user: dict = Depends(get_current_user),
 ):
-    session = sessions.get(req.session_id)
+    session = session_store.load_session(req.session_id)
     if not session:
         raise HTTPException(404, "Session not found — please start a new session.")
 
@@ -352,14 +350,14 @@ def chat(
         raise HTTPException(403, "Not authorized for this session")
 
     msg_safety = detect_safety_level(req.message)
-    session["safety_level"] = max(session["safety_level"], msg_safety)
+    safety_level = max(session["safety_level"], msg_safety)
     dsm_context = retrieve_context(req.message)
 
     system_prompt = build_system_prompt(
         persona_id  =session["persona_id"],
         algee_stage =session["algee_stage"],
         dsm_context =dsm_context,
-        safety_level=session["safety_level"],
+        safety_level=safety_level,
     )
 
     history_window = session["history"][-(MAX_HISTORY_TURNS * 2):]
@@ -376,6 +374,7 @@ def chat(
         )
         reply = response.choices[0].message.content.strip()
     except Exception as e:
+        logger.error("LLM call failed for session %s: %s", req.session_id[:8], type(e).__name__)
         error_str = str(e)
         if "content_filter" in error_str.lower():
             reply = (
@@ -386,26 +385,90 @@ def chat(
         else:
             reply = "Sorry, I had trouble connecting. Please try again."
 
-    session["history"].append({"role": "user", "content": req.message})
-    session["history"].append({"role": "assistant", "content": reply})
+    # Persist messages (encrypted)
+    session_store.append_message(req.session_id, "user", req.message)
+    session_store.append_message(req.session_id, "assistant", reply)
 
-    session["turns_in_stage"] = session.get("turns_in_stage", 0) + 1
+    # Advance ALGEE stage
+    turns_in_stage = session.get("turns_in_stage", 0) + 1
+    algee_stage = session["algee_stage"]
 
     if should_advance_stage(session, req.message):
-        old_stage = session["algee_stage"]
-        session["algee_stage"] = min(session["algee_stage"] + 1, len(ALGEE_STAGES) - 1)
-        if session["algee_stage"] != old_stage:
-            session["turns_in_stage"] = 0
+        old_stage = algee_stage
+        algee_stage = min(algee_stage + 1, len(ALGEE_STAGES) - 1)
+        if algee_stage != old_stage:
+            turns_in_stage = 0
 
-    if session["safety_level"] >= 1:
-        session["algee_stage"] = min(session["algee_stage"], 3)
+    if safety_level >= 1:
+        algee_stage = min(algee_stage, 3)
 
-    stage_name = ALGEE_STAGES[session["algee_stage"]]["name"]
+    # Persist session state
+    session_store.update_session(
+        req.session_id,
+        safety_level=safety_level,
+        algee_stage=algee_stage,
+        turns_in_stage=turns_in_stage,
+    )
+
+    stage_name = ALGEE_STAGES[algee_stage]["name"]
+    logger.info(
+        "Chat session=%s stage=%s safety=%d",
+        req.session_id[:8], stage_name, safety_level,
+    )
 
     return ChatResponse(
         reply=reply,
-        safety_level=session["safety_level"],
-        algee_stage=session["algee_stage"],
+        safety_level=safety_level,
+        algee_stage=algee_stage,
         algee_stage_name=stage_name,
         crisis_resources=CRISIS_RESOURCES if msg_safety == 2 else None,
     )
+
+
+# ─── GDPR: User Data Export & Deletion ───────────────────────
+
+@app.get("/user/data")
+@limiter.limit("3/minute")
+def export_data(
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """Export all session and message data for the authenticated user."""
+    user_id = user.get("sub")
+    data = session_store.export_user_data(user_id)
+    return {"user_id": user_id, "sessions": data}
+
+
+@app.delete("/user/data")
+@limiter.limit("3/minute")
+def delete_data(
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """Permanently delete all session and message data for the authenticated user."""
+    user_id = user.get("sub")
+    count = session_store.delete_user_data(user_id)
+    logger.info("User %s requested data deletion: %d sessions removed", user_id[:8], count)
+    return {"deleted_sessions": count}
+
+
+# ─── Informed Consent Disclosure ─────────────────────────────
+
+@app.get("/consent/info")
+@limiter.limit("10/minute")
+def consent_info(request: Request):
+    """Public — returns data processing disclosure for informed consent."""
+    return {
+        "disclosure": (
+            "Your messages are processed by Microsoft Azure OpenAI to generate responses. "
+            "Message content is encrypted before storage and is never shared with third parties "
+            "beyond what is required for AI processing. You can export or permanently delete "
+            "all your data at any time via your account settings."
+        ),
+        "data_processor": "Microsoft Azure OpenAI",
+        "encryption": "AES-128 (Fernet) at application level, plus database encryption at rest",
+        "user_rights": [
+            "Export all your data (GET /user/data)",
+            "Delete all your data (DELETE /user/data)",
+        ],
+    }

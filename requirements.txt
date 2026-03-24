@@ -15,7 +15,8 @@ tiktoken>=0.8.0
 colorama>=0.4.6
 gunicorn>=23.0.0
 
-# ── Security ───────────────────────────────────────────────
+# ── Security & Storage ─────────────────────────────────────
 PyJWT
 cryptography
 slowapi>=0.1.9
+supabase>=2.0.0
