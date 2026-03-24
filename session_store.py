@@ -105,6 +105,60 @@ def load_session(session_id: str) -> Optional[dict]:
     }
 
 
+def list_user_sessions(user_id: str) -> list[dict]:
+    """Return all sessions for a user (metadata only, no messages)."""
+    sb = _get_sb()
+    result = (
+        sb.table("sessions")
+        .select("id, persona_id, algee_stage, created_at, updated_at")
+        .eq("user_id", user_id)
+        .order("updated_at", desc=True)
+        .execute()
+    )
+    sessions = []
+    for row in result.data:
+        # Fetch the last user message as preview
+        last_msg = (
+            sb.table("messages")
+            .select("content_enc")
+            .eq("session_id", row["id"])
+            .eq("role", "user")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        preview = decrypt(last_msg.data[0]["content_enc"]) if last_msg.data else "New session"
+        sessions.append({
+            "session_id": row["id"],
+            "persona_id": row["persona_id"],
+            "algee_stage": row["algee_stage"],
+            "preview": preview[:100],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        })
+    return sessions
+
+
+def load_session_messages(session_id: str) -> list[dict]:
+    """Load decrypted messages for a session."""
+    sb = _get_sb()
+    msgs = (
+        sb.table("messages")
+        .select("role, content_enc, created_at")
+        .eq("session_id", session_id)
+        .order("created_at")
+        .execute()
+    )
+    return [
+        {
+            "role": m["role"],
+            "content": decrypt(m["content_enc"]),
+            "time": m["created_at"],
+        }
+        for m in msgs.data
+    ]
+
+
 def update_session(session_id: str, **fields) -> None:
     """Update session metadata (algee_stage, safety_level, turns_in_stage)."""
     allowed = {"algee_stage", "safety_level", "turns_in_stage"}

@@ -9,13 +9,14 @@ import os
 import uuid
 import time
 import logging
+from collections import defaultdict
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, validator
 from dotenv import load_dotenv
-from starlette.responses import Response
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -55,10 +56,18 @@ app.state.limiter = limiter
 
 @app.exception_handler(RateLimitExceeded)
 async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    return Response(
-        content='{"detail":"Too many requests — please slow down."}',
+    rid = getattr(request.state, "request_id", "unknown")
+    return JSONResponse(
         status_code=429,
-        media_type="application/json",
+        content={"detail": "Too many requests — please slow down.", "request_id": rid},
+    )
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException):
+    rid = getattr(request.state, "request_id", "unknown")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "request_id": rid},
     )
 
 # ─── CORS ─────────────────────────────────────────────────
@@ -74,10 +83,38 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-# ─── Security Headers ────────────────────────────────────
+# ─── Security Monitoring ──────────────────────────────────
+# Track auth failures per IP — log warnings when threshold is exceeded.
+
+_auth_failures: dict = defaultdict(list)  # ip -> [timestamps]
+AUTH_FAIL_THRESHOLD = 5   # failures within window triggers alert
+AUTH_FAIL_WINDOW    = 300  # 5 minute window
+
+
+def record_auth_failure(ip: str) -> None:
+    """Record a failed auth attempt and warn if threshold exceeded."""
+    now = time.time()
+    _auth_failures[ip] = [t for t in _auth_failures[ip] if now - t < AUTH_FAIL_WINDOW]
+    _auth_failures[ip].append(now)
+    if len(_auth_failures[ip]) >= AUTH_FAIL_THRESHOLD:
+        logger.warning(
+            "SECURITY: %d auth failures from %s in %ds",
+            len(_auth_failures[ip]), ip, AUTH_FAIL_WINDOW,
+        )
+
+
+# ─── Request ID + Security Headers ──────────────────────
 @app.middleware("http")
-async def add_security_headers(request: Request, call_next):
+async def add_request_context(request: Request, call_next):
+    request_id = str(uuid.uuid4())[:8]
+    request.state.request_id = request_id
+
     response = await call_next(request)
+
+    # Attach request ID to every response
+    response.headers["X-Request-ID"] = request_id
+
+    # Security headers
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
@@ -100,10 +137,13 @@ security = HTTPBearer(auto_error=False)
 
 
 def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> dict:
     """Verify Supabase JWT and return user payload."""
+    client_ip = get_remote_address(request)
     if not credentials:
+        record_auth_failure(client_ip)
         raise HTTPException(401, "Authentication required")
     try:
         signing_key = jwks_client.get_signing_key_from_jwt(
@@ -117,8 +157,11 @@ def get_current_user(
         )
         return payload
     except jwt.ExpiredSignatureError:
+        record_auth_failure(client_ip)
         raise HTTPException(401, "Token expired — please sign in again")
     except jwt.InvalidTokenError:
+        record_auth_failure(client_ip)
+        logger.warning("Invalid token from %s", client_ip)
         raise HTTPException(401, "Invalid token")
 
 
@@ -461,6 +504,42 @@ def chat(
         algee_stage_name=stage_name,
         crisis_resources=CRISIS_RESOURCES if msg_safety == 2 else None,
     )
+
+
+# ─── Session History ──────────────────────────────────────────
+
+@app.get("/sessions")
+@limiter.limit("10/minute")
+def list_sessions(
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """List all sessions for the authenticated user (metadata + preview, no full messages)."""
+    user_id = user.get("sub")
+    sessions = session_store.list_user_sessions(user_id)
+    return {"sessions": sessions}
+
+
+@app.get("/sessions/{session_id}/messages")
+@limiter.limit("10/minute")
+def get_session_messages(
+    session_id: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """Load decrypted messages for a specific session."""
+    session = session_store.load_session(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    if session["user_id"] != user.get("sub"):
+        raise HTTPException(403, "Not authorized for this session")
+
+    messages = session_store.load_session_messages(session_id)
+    return {
+        "session_id": session_id,
+        "persona_id": session["persona_id"],
+        "messages": messages,
+    }
 
 
 # ─── GDPR: User Data Export & Deletion ───────────────────────
