@@ -14,3 +14,7 @@ python-dotenv>=1.0.1
 tiktoken>=0.8.0
 colorama>=0.4.6
 gunicorn>=23.0.0
+
+# ── Authentication ──────────────────────────────────────────
+PyJWT
+cryptography

@@ -9,13 +9,16 @@ import os
 import uuid
 import time
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, validator
 from dotenv import load_dotenv
 import chromadb
 from chromadb.config import Settings
 from openai import AzureOpenAI
+import jwt
+from jwt import PyJWKClient
 
 from config import (
     PERSONAS, DEFAULT_PERSONA, ALGEE_STAGES, CORE_RULES,
@@ -25,20 +28,56 @@ from config import (
 
 load_dotenv()
 
-# ─── App ─────────────────────────────────────────────────────────
+# ─── App ─────────────────────────────────────────────────────
 
 app = FastAPI(title="Kalm API", version="1.0.0")
 START_TIME = time.time()
 
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS", "https://kalm-omega.vercel.app"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ─── Azure Clients ────────────────────────────────────────────────
+# ─── Auth (Supabase JWKS) ───────────────────────────────────
+
+SUPABASE_URL = os.getenv(
+    "SUPABASE_URL", "https://uqsetzkddvjjrguqoemn.supabase.co"
+)
+jwks_client = PyJWKClient(f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json")
+security = HTTPBearer(auto_error=False)
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> dict:
+    """Verify Supabase JWT and return user payload."""
+    if not credentials:
+        raise HTTPException(401, "Authentication required")
+    try:
+        signing_key = jwks_client.get_signing_key_from_jwt(
+            credentials.credentials
+        )
+        payload = jwt.decode(
+            credentials.credentials,
+            signing_key.key,
+            algorithms=["ES256"],
+            audience="authenticated",
+        )
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Token expired — please sign in again")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid token")
+
+
+# ─── Azure Clients ──────────────────────────────────────────
 
 AZURE_ENDPOINT       = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_API_KEY        = os.getenv("AZURE_OPENAI_API_KEY")
@@ -49,7 +88,7 @@ CHROMA_DB_PATH       = os.getenv("CHROMA_DB_PATH", "./kalm_db")
 TOP_K                = int(os.getenv("TOP_K_RESULTS", "5"))
 COLLECTION_NAME      = "dsm_knowledge"
 MAX_HISTORY_TURNS    = 8
-MAX_RESPONSE_TOKENS  = 250  # Texting-peer style — short bursts, not paragraphs
+MAX_RESPONSE_TOKENS  = 250
 
 az_client = AzureOpenAI(
     azure_endpoint=AZURE_ENDPOINT,
@@ -74,13 +113,15 @@ except Exception as e:
     print(f"✗ ChromaDB failed: {e}")
     collection = None
 
-# ─── Sessions ─────────────────────────────────────────────────────
+# ─── Sessions ───────────────────────────────────────────────
 
 sessions: dict = {}
 
-def new_session(persona_id: str) -> dict:
+
+def new_session(persona_id: str, user_id: str) -> dict:
     return {
         "id": str(uuid.uuid4()),
+        "user_id": user_id,
         "persona_id": persona_id,
         "history": [],
         "algee_stage": 0,
@@ -88,24 +129,19 @@ def new_session(persona_id: str) -> dict:
         "turns_in_stage": 0,
     }
 
-# ─── ALGEE Stage Advancement ─────────────────────────────────────
-# Minimum user turns before the stage can advance.
-# This prevents the bot from rushing to "see a professional" after 2 messages.
+
+# ─── ALGEE Stage Advancement ───────────────────────────────
+
 STAGE_MIN_TURNS = {
-    "approach":               3,   # 3 turns just listening, no advice
-    "listen":                 3,   # 3 turns validating before giving any info
-    "give_info":              2,   # 2 turns of info before suggesting professional help
-    "encourage_professional": 2,   # 2 turns before moving to self-help strategies
-    "encourage_self":         99,  # never auto-advance past this
+    "approach":               3,
+    "listen":                 3,
+    "give_info":              2,
+    "encourage_professional": 2,
+    "encourage_self":         99,
 }
 
+
 def should_advance_stage(session: dict, user_message: str) -> bool:
-    """
-    Advance the ALGEE stage only when:
-    1. The minimum turns for this stage have been spent
-    2. The user message shows meaningful engagement (>6 words)
-       Short replies like "ok", "yeah", "idk" mean stay and keep listening
-    """
     current_stage_name = ALGEE_STAGES[session["algee_stage"]]["name"]
     min_turns = STAGE_MIN_TURNS.get(current_stage_name, 2)
     turns_in_stage = session.get("turns_in_stage", 0)
@@ -113,14 +149,14 @@ def should_advance_stage(session: dict, user_message: str) -> bool:
     if turns_in_stage < min_turns:
         return False
 
-    # Short messages = user hasn't opened up yet — give them more time
     word_count = len(user_message.strip().split())
     if word_count < 6 and turns_in_stage < (min_turns + 2):
         return False
 
     return True
 
-# ─── Safety ───────────────────────────────────────────────────────
+
+# ─── Safety ─────────────────────────────────────────────────
 
 def detect_safety_level(text: str) -> int:
     lower = text.lower()
@@ -131,7 +167,8 @@ def detect_safety_level(text: str) -> int:
         return 1
     return 0
 
-# ─── RAG ──────────────────────────────────────────────────────────
+
+# ─── RAG ────────────────────────────────────────────────────
 
 def retrieve_context(query: str) -> str:
     if not collection:
@@ -167,7 +204,8 @@ def retrieve_context(query: str) -> str:
         print(f"RAG error: {e}")
         return ""
 
-# ─── Prompt ───────────────────────────────────────────────────────
+
+# ─── Prompt ─────────────────────────────────────────────────
 
 def build_system_prompt(persona_id, algee_stage, dsm_context, safety_level) -> str:
     persona    = PERSONAS[persona_id]
@@ -196,14 +234,25 @@ def build_system_prompt(persona_id, algee_stage, dsm_context, safety_level) -> s
         f"{safety_block}"
     )
 
-# ─── Models ───────────────────────────────────────────────────────
+
+# ─── Models ─────────────────────────────────────────────────
 
 class NewSessionRequest(BaseModel):
     persona_id: Optional[str] = DEFAULT_PERSONA
 
+
 class ChatRequest(BaseModel):
     session_id: str
     message: str
+
+    @validator("message")
+    def message_must_be_valid(cls, v):
+        if len(v.strip()) == 0:
+            raise ValueError("Message cannot be empty")
+        if len(v) > 2000:
+            raise ValueError("Message too long (max 2000 characters)")
+        return v.strip()
+
 
 class ChatResponse(BaseModel):
     reply: str
@@ -212,11 +261,12 @@ class ChatResponse(BaseModel):
     algee_stage_name: str
     crisis_resources: Optional[str] = None
 
-# ─── Endpoints ────────────────────────────────────────────────────
+
+# ─── Endpoints ──────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    """Used by frontend to wake up the server and check status."""
+    """Public — used by frontend to wake up the server."""
     return {
         "status": "ok",
         "db_chunks": collection.count() if collection else 0,
@@ -224,21 +274,26 @@ def health():
         "uptime_seconds": round(time.time() - START_TIME),
     }
 
+
 @app.get("/ping")
 def ping():
-    """Lightweight wake-up endpoint."""
+    """Public — lightweight wake-up endpoint."""
     return {"pong": True}
 
+
 @app.post("/session/new")
-def create_session(req: NewSessionRequest):
+def create_session(
+    req: NewSessionRequest,
+    user: dict = Depends(get_current_user),
+):
     if req.persona_id not in PERSONAS:
         raise HTTPException(400, f"Unknown persona: {req.persona_id}")
-    session = new_session(req.persona_id)
+
+    user_id = user.get("sub", "anonymous")
+    session = new_session(req.persona_id, user_id)
     sessions[session["id"]] = session
 
     greetings = {
-        # Each greeting is written in that character's voice —
-        # short, human, no therapy opener, just an invitation to talk.
         "mack": "Go ahead. I'm listening.",
         "ray":  "Alright, what's going on?",
         "deb":  "Hey. Whatever's on your mind — this is a good place for it.",
@@ -253,11 +308,19 @@ def create_session(req: NewSessionRequest):
         "persona": PERSONAS[req.persona_id]["label"],
     }
 
+
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+def chat(
+    req: ChatRequest,
+    user: dict = Depends(get_current_user),
+):
     session = sessions.get(req.session_id)
     if not session:
         raise HTTPException(404, "Session not found — please start a new session.")
+
+    # Ensure user owns this session
+    if session.get("user_id") and session["user_id"] != user.get("sub"):
+        raise HTTPException(403, "Not authorized for this session")
 
     msg_safety = detect_safety_level(req.message)
     session["safety_level"] = max(session["safety_level"], msg_safety)
@@ -292,23 +355,19 @@ def chat(req: ChatRequest):
                 "They're available 24/7 and understand what you're going through."
             )
         else:
-            reply = f"Sorry, I had trouble connecting. Please try again."
+            reply = "Sorry, I had trouble connecting. Please try again."
 
     session["history"].append({"role": "user", "content": req.message})
     session["history"].append({"role": "assistant", "content": reply})
 
-    # Increment turns in current stage
     session["turns_in_stage"] = session.get("turns_in_stage", 0) + 1
 
-    # Only advance stage when the user is genuinely ready
     if should_advance_stage(session, req.message):
         old_stage = session["algee_stage"]
         session["algee_stage"] = min(session["algee_stage"] + 1, len(ALGEE_STAGES) - 1)
-        # Reset turn counter when stage changes
         if session["algee_stage"] != old_stage:
             session["turns_in_stage"] = 0
 
-    # ALGEE hold — never push past encourage_professional during crisis
     if session["safety_level"] >= 1:
         session["algee_stage"] = min(session["algee_stage"], 3)
 
