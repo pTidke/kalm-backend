@@ -87,10 +87,15 @@ async def add_security_headers(request: Request, call_next):
 
 # ─── Auth (Supabase JWKS) ───────────────────────────────────
 
-SUPABASE_URL = os.getenv(
-    "SUPABASE_URL", "https://uqsetzkddvjjrguqoemn.supabase.co"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+if not SUPABASE_URL:
+    raise RuntimeError("SUPABASE_URL environment variable must be set")
+
+jwks_client = PyJWKClient(
+    f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json",
+    cache_jwk_set=True,
+    lifespan=3600,  # Cache JWKS for 1 hour
 )
-jwks_client = PyJWKClient(f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json")
 security = HTTPBearer(auto_error=False)
 
 
@@ -190,6 +195,37 @@ def detect_safety_level(text: str) -> int:
     if hopeless_hits >= 1:
         return 1
     return 0
+
+
+# ─── Prompt Injection Guard ────────────────────────────────
+
+import re
+
+_INJECTION_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"ignore\s+(all\s+)?(previous|above|prior)\s+(instructions|prompts|rules)",
+        r"you\s+are\s+now\s+",
+        r"system\s*:",
+        r"act\s+as\s+(a|an|if)\s+",
+        r"pretend\s+(you('re| are)\s+)",
+        r"do\s+not\s+follow\s+(your|the)\s+(rules|instructions)",
+        r"forget\s+(everything|your\s+(instructions|rules|prompt))",
+        r"new\s+instructions?\s*:",
+        r"\[\s*system\s*\]",
+        r"<\|?system\|?>",
+    ]
+]
+
+
+def sanitize_user_input(text: str) -> str:
+    """Strip common prompt injection patterns from user messages."""
+    cleaned = text
+    for pattern in _INJECTION_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return "."  # Entire message was injection — send neutral placeholder
+    return cleaned
 
 
 # ─── RAG ────────────────────────────────────────────────────
@@ -349,9 +385,11 @@ def chat(
     if session["user_id"] != user.get("sub"):
         raise HTTPException(403, "Not authorized for this session")
 
-    msg_safety = detect_safety_level(req.message)
+    safe_message = sanitize_user_input(req.message)
+
+    msg_safety = detect_safety_level(req.message)  # Check original for safety signals
     safety_level = max(session["safety_level"], msg_safety)
-    dsm_context = retrieve_context(req.message)
+    dsm_context = retrieve_context(safe_message)
 
     system_prompt = build_system_prompt(
         persona_id  =session["persona_id"],
@@ -363,7 +401,7 @@ def chat(
     history_window = session["history"][-(MAX_HISTORY_TURNS * 2):]
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history_window)
-    messages.append({"role": "user", "content": req.message})
+    messages.append({"role": "user", "content": safe_message})
 
     try:
         response = az_client.chat.completions.create(
