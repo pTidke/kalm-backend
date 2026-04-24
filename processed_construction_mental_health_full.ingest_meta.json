@@ -1,0 +1,18 @@
+{
+  "script": "ingest_csv_reddit.py",
+  "project": "Kalm \u2014 LLM-Based Mental Health Support for Construction Workers",
+  "lab": "LINC Lab, SDSU",
+  "pi": "Dr. JuHyeon Bae",
+  "input_file": "processed_construction_mental_health_full.csv",
+  "ingestion_date": "2026-04-24T21:43:40.320990+00:00",
+  "filters": {
+    "min_score": 2,
+    "min_words": 15,
+    "max_depth": 5
+  },
+  "raw_records": 8350,
+  "filtered_records": 3721,
+  "documents_ingested": 3721,
+  "collection_name": "reddit_peer_knowledge",
+  "anonymization": "authors excluded from CSV load; usernames, emails, phone numbers, URLs, SSNs stripped from text"
+}

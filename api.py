@@ -174,7 +174,9 @@ CHAT_DEPLOYMENT      = os.getenv("AZURE_CHAT_DEPLOYMENT", "gpt-4.1")
 EMBEDDING_DEPLOYMENT = os.getenv("AZURE_EMBEDDING_DEPLOYMENT", "text-embedding-ada-002")
 CHROMA_DB_PATH       = os.getenv("CHROMA_DB_PATH", "./kalm_db")
 TOP_K                = int(os.getenv("TOP_K_RESULTS", "5"))
-COLLECTION_NAME      = "dsm_knowledge"
+COLLECTION_NAME        = "dsm_knowledge"
+REDDIT_COLLECTION_NAME = "reddit_peer_knowledge"
+REDDIT_TOP_K           = int(os.getenv("REDDIT_TOP_K_RESULTS", "4"))
 MAX_HISTORY_TURNS    = 8
 MAX_RESPONSE_TOKENS  = 250
 
@@ -196,10 +198,18 @@ try:
         settings=Settings(anonymized_telemetry=False),
     )
     collection = chroma_client.get_collection(COLLECTION_NAME)
-    logger.info("ChromaDB loaded — %s chunks", f"{collection.count():,}")
+    logger.info("ChromaDB [dsm_knowledge] loaded — %s chunks", f"{collection.count():,}")
 except Exception as e:
-    logger.error("ChromaDB failed to load: %s", type(e).__name__)
+    logger.error("ChromaDB [dsm_knowledge] failed to load: %s", type(e).__name__)
     collection = None
+
+# Reddit peer knowledge collection
+try:
+    reddit_collection = chroma_client.get_collection(REDDIT_COLLECTION_NAME)
+    logger.info("ChromaDB [reddit_peer_knowledge] loaded — %s chunks", f"{reddit_collection.count():,}")
+except Exception as e:
+    logger.warning("ChromaDB [reddit_peer_knowledge] not available: %s (RAG will use DSM only)", type(e).__name__)
+    reddit_collection = None
 
 
 # ─── ALGEE Stage Advancement ───────────────────────────────
@@ -273,52 +283,110 @@ def sanitize_user_input(text: str) -> str:
 
 # ─── RAG ────────────────────────────────────────────────────
 
-def retrieve_context(query: str) -> str:
-    if not collection:
-        return ""
+def retrieve_context(query: str) -> dict:
+    """
+    Retrieve context from both DSM clinical knowledge and Reddit peer
+    experience collections. Returns a dict with separate keys so the
+    system prompt can handle them differently.
+    """
+    result = {"dsm": "", "peer": ""}
+
     try:
         response = embed_client.embeddings.create(
             input=[query], model=EMBEDDING_DEPLOYMENT,
         )
         query_vector = response.data[0].embedding
-        results = collection.query(
-            query_embeddings=[query_vector],
-            n_results=TOP_K,
-            include=["documents", "metadatas", "distances"],
-        )
-        docs      = results["documents"][0]
-        metadatas = results["metadatas"][0]
-        distances = results["distances"][0]
-
-        seen = {}
-        for doc, meta, dist in zip(docs, metadatas, distances):
-            disorder = meta.get("disorder_name", "Unknown")
-            if disorder not in seen or dist < seen[disorder][0]:
-                seen[disorder] = (dist, doc, meta.get("section", ""))
-
-        parts = []
-        for disorder, (dist, doc, section) in list(seen.items())[:3]:
-            similarity = round((1 - dist) * 100, 1)
-            parts.append(
-                f"[Clinical Reference — {disorder} / {section} (relevance: {similarity}%)]\n{doc}"
-            )
-        return "\n\n".join(parts)
     except Exception as e:
-        logger.error("RAG retrieval failed: %s", type(e).__name__)
-        return ""
+        logger.error("Embedding failed: %s", type(e).__name__)
+        return result
+
+    # ── DSM clinical knowledge ──
+    if collection:
+        try:
+            dsm_results = collection.query(
+                query_embeddings=[query_vector],
+                n_results=TOP_K,
+                include=["documents", "metadatas", "distances"],
+            )
+            docs      = dsm_results["documents"][0]
+            metadatas = dsm_results["metadatas"][0]
+            distances = dsm_results["distances"][0]
+
+            seen = {}
+            for doc, meta, dist in zip(docs, metadatas, distances):
+                disorder = meta.get("disorder_name", "Unknown")
+                if disorder not in seen or dist < seen[disorder][0]:
+                    seen[disorder] = (dist, doc, meta.get("section", ""))
+
+            parts = []
+            for disorder, (dist, doc, section) in list(seen.items())[:3]:
+                similarity = round((1 - dist) * 100, 1)
+                parts.append(
+                    f"[Clinical Reference — {disorder} / {section} (relevance: {similarity}%)]\n{doc}"
+                )
+            result["dsm"] = "\n\n".join(parts)
+        except Exception as e:
+            logger.error("DSM retrieval failed: %s", type(e).__name__)
+
+    # ── Reddit peer knowledge ──
+    if reddit_collection:
+        try:
+            reddit_results = reddit_collection.query(
+                query_embeddings=[query_vector],
+                n_results=REDDIT_TOP_K,
+                include=["documents", "metadatas", "distances"],
+            )
+            docs      = reddit_results["documents"][0]
+            metadatas = reddit_results["metadatas"][0]
+            distances = reddit_results["distances"][0]
+
+            parts = []
+            for doc, meta, dist in zip(docs, metadatas, distances):
+                similarity = round((1 - dist) * 100, 1)
+                # Only include results with reasonable relevance
+                if similarity < 30:
+                    continue
+                content_type = meta.get("content_type", "peer_comment")
+                score = meta.get("score", 0)
+                label = {
+                    "lived_experience": "Worker sharing their experience",
+                    "peer_advice":      f"Peer advice (community score: {score})",
+                    "peer_response":    f"Peer response (score: {score})",
+                    "peer_comment":     "Community discussion",
+                }.get(content_type, "Peer context")
+                parts.append(
+                    f"[{label} — relevance: {similarity}%]\n{doc}"
+                )
+            result["peer"] = "\n\n".join(parts)
+        except Exception as e:
+            logger.error("Reddit peer retrieval failed: %s", type(e).__name__)
+
+    return result
 
 
 # ─── Prompt ─────────────────────────────────────────────────
 
-def build_system_prompt(persona_id, algee_stage, dsm_context, safety_level) -> str:
+def build_system_prompt(persona_id, algee_stage, dsm_context, peer_context, safety_level) -> str:
     persona    = PERSONAS[persona_id]
     stage      = ALGEE_STAGES[min(algee_stage, len(ALGEE_STAGES) - 1)]
     stage_name = stage["name"].upper().replace("_", " ")
     stage_guide= stage["guidance"]
 
     context_block = ""
+
+    # Peer context available from LISTEN stage onward (stage >= 1)
+    # Informs tone and relatability — not clinical guidance
+    if peer_context and algee_stage >= 1:
+        context_block += (
+            "\n\nREAL PEER EXPERIENCES (use to match language and tone; "
+            "never quote directly — absorb the way workers talk about these issues "
+            "and reflect it naturally in your voice):\n"
+            f"{peer_context}"
+        )
+
+    # Clinical context from GIVE INFO stage onward (stage >= 2) — unchanged
     if dsm_context and algee_stage >= 2:
-        context_block = (
+        context_block += (
             f"\n\nRELEVANT CLINICAL BACKGROUND (translate fully into plain language; never quote directly):\n"
             f"{dsm_context}"
         )
@@ -432,13 +500,14 @@ def chat(
 
     msg_safety = detect_safety_level(req.message)  # Check original for safety signals
     safety_level = max(session["safety_level"], msg_safety)
-    dsm_context = retrieve_context(safe_message)
+    rag_context = retrieve_context(safe_message)
 
     system_prompt = build_system_prompt(
-        persona_id  =session["persona_id"],
-        algee_stage =session["algee_stage"],
-        dsm_context =dsm_context,
-        safety_level=safety_level,
+        persona_id   = session["persona_id"],
+        algee_stage  = session["algee_stage"],
+        dsm_context  = rag_context["dsm"],
+        peer_context = rag_context["peer"],
+        safety_level = safety_level,
     )
 
     history_window = session["history"][-(MAX_HISTORY_TURNS * 2):]
